@@ -3,26 +3,40 @@ package spark.project1
 import org.apache.spark.SparkConf
 import org.apache.spark.SparkContext
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql._
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.Row
 import scala.io.Source._
+import org.apache.spark.sql.hive.HiveContext
 
 object WebCustAnalytics {
   
     def main(args: Array[String]):Unit = {
       
-          val spark = SparkSession.builder().master("local[1]").appName("WebAnalytics").getOrCreate()
+          val spark = SparkSession.builder().master("local[1]").appName("WebAnalytics")
+                                            .enableHiveSupport()
+                                            .config("hive.exec.dynamic.partition","true")
+                                            .config("hive.exec.dynamic.partition.mode","nonstrict")
+                                            .getOrCreate()
           import spark.implicits._
           val sc=spark.sparkContext
           sc.setLogLevel("ERROR")
           
+          //val hc=new HiveContext(sc)
+          //import hc.implicits._
+          
+          println("================Phase 2: Step 1 - calculating yesterday's date===================")
+          val yestday = java.time.LocalDate.now.minusDays(1)
+          
           println
           println("=============Step 2: Read Avro file as a dataframe==================")
           val avrodf = spark.read.format("com.databricks.spark.avro")
-                                 .load("file:///C:/Users/vamse/Downloads/batch28_zeyo_data/spark_project1_data/part-00000.avro")                     
+                                 //.load(s"hdfs:/user/cloudera/spark_proj1/input/$yestday")
+                                 .load(s"file:///C:/Users/vamse/Downloads/batch28_zeyo_data/spark_project1_data/$yestday/")                     
           avrodf.printSchema()
           avrodf.show()
+          //println("avrodf count: " + avrodf.count())
           
           println("==============Step 3: Read Random API URL data================")
           val url="https://randomuser.me/api/0.8/?results=200"
@@ -66,15 +80,30 @@ object WebCustAnalytics {
           
           println("===============Step 5: Remove Numericals from username of urlflatdf===================")
           val urlfinaldf = urlflatdf.withColumn("user_username", regexp_extract(col("user_username"), "[a-z]+", 0))
+          //val urlfinaldf = urlflatdf.withColumn("user_username",regexp_replace(col("user_username"),  "([0-9])", ""))
           urlfinaldf.show()
           
+          /*println("url flattened df count: " + urlfinaldf.count())
+          println("avro df distinct username count: ") 
+          avrodf.agg(countDistinct(trim(col("username")))).show()*/
+          
+          /*println("url flattened df distinct username count: ") 
+          urlfinaldf.agg(countDistinct(trim(col("user_username")))).show()*/
+
           println("===============Step 6: Broadcast Left Join Avro df with urlflatdf=====================")
           
-          val bcleftjoindf = avrodf.join(broadcast(urlfinaldf),avrodf("username")===urlfinaldf("user_username"),"left")
-                                   //.drop(col("user_username"))
+          val bcleftjoindf = avrodf.join(broadcast(urlfinaldf),trim(avrodf("username"))===trim(urlfinaldf("user_username")),"left")
+                                   .drop(col("user_username"))
           
           bcleftjoindf.printSchema()
           bcleftjoindf.show()
+          
+          /*println("broadcast left join df count: " + bcleftjoindf.count())
+          println("broadcast left join username distinct count: ") 
+          bcleftjoindf.agg(countDistinct(trim(col("username")))).show()
+          bcleftjoindf.createOrReplaceTempView("joindf")
+          val dupes = spark.sql("select id, count(*) as cnt from joindf group by id having cnt > 1")
+          dupes.show(10,false)*/
           
           println("================Step 7: Two dfs with Nationality Null and Not Null====================")
           val nonAvailCustTemp = bcleftjoindf.filter(col("nationality").isNull)
@@ -112,6 +141,7 @@ object WebCustAnalytics {
           
           finalAvailCustdf.coalesce(1).write.format("json")
                                            .mode("overwrite")
+                                           //.save("hdfs:/user/cloudera/spark_proj1/output/avail_cust_json")
                                            .save("file:///C:/Users/vamse/Downloads/batch28_zeyo_data/spark_project1_data/avail_cust_json")
                                            
           println("=============available customers json written to local successfully==================")
@@ -131,10 +161,44 @@ object WebCustAnalytics {
           
           finalNonAvailCustdf.coalesce(1).write.format("json")
                                                .mode("overwrite")
+                                               //.save("hdfs:/user/cloudera/spark_proj1/output/nonavail_cust_json")
                                                .save("file:///C:/Users/vamse/Downloads/batch28_zeyo_data/spark_project1_data/nonavail_cust_json")
                                                
           println("=============Non available customers json written to local successfully==================")
           
+          println("=============Calculate max value from hive table spark_proj1.web_cust_analytics and store it in a variable==============")
+          val max_id = spark.sql("select nvl(max(id),0) as max_id from spark_proj1.web_cust_analytics")
+                                .collect.map(_.mkString("")).mkString.toInt 
+          println("max_id: " + max_id)
+          //val max_id = 0
+          
+          println("================Generate Index column and replace id column with it and add max id value to each index====================")
+          val addMaxIndexdf = addColumnIndex(spark, bcleftjoindf)
+                                .withColumn("id", col("index")).drop("index")
+                                .withColumn("id", col("id").cast("long") + max_id)
+                                .na.fill("NA").na.fill(0)
+                          
+          addMaxIndexdf.printSchema()
+          addMaxIndexdf.show(10,false)
+          
+          println("final addMaxIndexdf count: " + addMaxIndexdf.count())
+          
+          println("============write the final output df to hive table==================")
+          
+          addMaxIndexdf.write.format("hive").mode("append").saveAsTable("spark_proj1.web_cust_analytics")
+          
+          println("=============Hive table written successfully==================")
+    }
+    
+    def addColumnIndex(spark: SparkSession, df: DataFrame) = {      //DataFrame is part of org.apache.spark.sql._ package 
+      
+        spark.createDataFrame(
+            
+            df.rdd.zipWithIndex.map{
+              case (row, index) => Row.fromSeq(row.toSeq :+ index)
+            },
+            StructType(df.schema.fields :+ StructField("index", LongType, false))
+        )
     }
   
 }
